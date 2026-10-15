@@ -11,6 +11,7 @@ export interface PendulumParams {
   l1: number; // meters
   l2: number;
   g: number;  // m/s^2
+  damping: number; // NEW: Friction coefficient
 }
 
 export interface Derivatives {
@@ -33,14 +34,14 @@ export const getDerivatives = (state: PendulumState, params: PendulumParams): De
   const num1_2 = -m2 * g * Math.sin(theta1 - 2 * theta2);
   const num1_3 = -2 * Math.sin(theta1 - theta2) * m2;
   const num1_4 = omega2 * omega2 * l2 + omega1 * omega1 * l1 * Math.cos(theta1 - theta2);
-  const alpha1 = (num1_1 + num1_2 + num1_3 * num1_4) / denom1;
+  const alpha1 = ((num1_1 + num1_2 + num1_3 * num1_4) / denom1) - (params.damping * omega1);
 
   const denom2 = l2 * (2 * m1 + m2 - m2 * Math.cos(2 * theta1 - 2 * theta2));
   const num2_1 = 2 * Math.sin(theta1 - theta2);
   const num2_2 = omega1 * omega1 * l1 * totalMass;
   const num2_3 = g * totalMass * Math.cos(theta1);
   const num2_4 = omega2 * omega2 * l2 * m2 * Math.cos(theta1 - theta2);
-  const alpha2 = (num2_1 * (num2_2 + num2_3 + num2_4)) / denom2;
+  const alpha2 = ((num2_1 * (num2_2 + num2_3 + num2_4)) / denom2) - (params.damping * omega2);
 
   return {
     dTheta1: omega1,
