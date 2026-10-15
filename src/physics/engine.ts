@@ -1,17 +1,17 @@
 export interface PendulumState {
   theta1: number; // radians from downward vertical
-  theta2: number;
-  omega1: number; // angular velocity
-  omega2: number;
+  theta2: number; // radians from downward vertical
+  omega1: number; // rad/s
+  omega2: number; // rad/s
 }
 
 export interface PendulumParams {
-  m1: number; // kg
-  m2: number;
-  l1: number; // meters
-  l2: number;
-  g: number;  // m/s^2
-  damping: number; // NEW: Friction coefficient
+  m1: number;      // kg
+  m2: number;      // kg
+  l1: number;      // meters
+  l2: number;      // meters
+  g: number;       // m/s^2
+  damping: number; // viscous joint damping (1/s)
 }
 
 export interface Derivatives {
@@ -21,41 +21,61 @@ export interface Derivatives {
   dOmega2: number;
 }
 
-// Calculates the angular accelerations (alpha1, alpha2) and velocities
+export interface BobKinematics {
+  pivotY: number;
+  x1: number;
+  y1: number;
+  z1: number;
+  vx1: number;
+  vy1: number;
+  speed1: number;
+  x2: number;
+  y2: number;
+  z2: number;
+  vx2: number;
+  vy2: number;
+  speed2: number;
+  alpha1: number;
+  alpha2: number;
+}
+
+export const PIVOT_HEIGHT = 3.2; // meters above the 3D floor (y = 0)
+
+// Calculates angular velocities and angular accelerations (alpha1, alpha2)
 export const getDerivatives = (state: PendulumState, params: PendulumParams): Derivatives => {
   const { theta1, theta2, omega1, omega2 } = state;
-  const { m1, m2, l1, l2, g } = params;
+  const { m1, m2, l1, l2, g, damping } = params;
 
-  const deltaTheta = theta1 - theta2;
   const totalMass = m1 + m2;
+  const delta = theta1 - theta2;
 
   const denom1 = l1 * (2 * m1 + m2 - m2 * Math.cos(2 * theta1 - 2 * theta2));
   const num1_1 = -g * (2 * m1 + m2) * Math.sin(theta1);
   const num1_2 = -m2 * g * Math.sin(theta1 - 2 * theta2);
-  const num1_3 = -2 * Math.sin(theta1 - theta2) * m2;
-  const num1_4 = omega2 * omega2 * l2 + omega1 * omega1 * l1 * Math.cos(theta1 - theta2);
-  const alpha1 = ((num1_1 + num1_2 + num1_3 * num1_4) / denom1) - (params.damping * omega1);
+  const num1_3 = -2 * Math.sin(delta) * m2;
+  const num1_4 = omega2 * omega2 * l2 + omega1 * omega1 * l1 * Math.cos(delta);
+  const alpha1 = (num1_1 + num1_2 + num1_3 * num1_4) / denom1 - damping * omega1;
 
   const denom2 = l2 * (2 * m1 + m2 - m2 * Math.cos(2 * theta1 - 2 * theta2));
-  const num2_1 = 2 * Math.sin(theta1 - theta2);
+  const num2_1 = 2 * Math.sin(delta);
   const num2_2 = omega1 * omega1 * l1 * totalMass;
   const num2_3 = g * totalMass * Math.cos(theta1);
-  const num2_4 = omega2 * omega2 * l2 * m2 * Math.cos(theta1 - theta2);
-  const alpha2 = ((num2_1 * (num2_2 + num2_3 + num2_4)) / denom2) - (params.damping * omega2);
+  const num2_4 = omega2 * omega2 * l2 * m2 * Math.cos(delta);
+  const alpha2 = (num2_1 * (num2_2 + num2_3 + num2_4)) / denom2 - damping * omega2;
 
   return {
     dTheta1: omega1,
     dTheta2: omega2,
     dOmega1: alpha1,
-    dOmega2: alpha2
+    dOmega2: alpha2,
   };
 };
 
-// 4th-Order Runge-Kutta numerical integration step
+// 4th-Order Runge-Kutta (RK4) integration step
 export const stepRK4 = (state: PendulumState, params: PendulumParams, dt: number): PendulumState => {
   const k1 = getDerivatives(state, params);
-  
-  const stateK2 = {
+
+  const stateK2: PendulumState = {
     theta1: state.theta1 + 0.5 * dt * k1.dTheta1,
     theta2: state.theta2 + 0.5 * dt * k1.dTheta2,
     omega1: state.omega1 + 0.5 * dt * k1.dOmega1,
@@ -63,7 +83,7 @@ export const stepRK4 = (state: PendulumState, params: PendulumParams, dt: number
   };
   const k2 = getDerivatives(stateK2, params);
 
-  const stateK3 = {
+  const stateK3: PendulumState = {
     theta1: state.theta1 + 0.5 * dt * k2.dTheta1,
     theta2: state.theta2 + 0.5 * dt * k2.dTheta2,
     omega1: state.omega1 + 0.5 * dt * k2.dOmega1,
@@ -71,7 +91,7 @@ export const stepRK4 = (state: PendulumState, params: PendulumParams, dt: number
   };
   const k3 = getDerivatives(stateK3, params);
 
-  const stateK4 = {
+  const stateK4: PendulumState = {
     theta1: state.theta1 + dt * k3.dTheta1,
     theta2: state.theta2 + dt * k3.dTheta2,
     omega1: state.omega1 + dt * k3.dOmega1,
@@ -87,19 +107,153 @@ export const stepRK4 = (state: PendulumState, params: PendulumParams, dt: number
   };
 };
 
-export const calculateEnergy = (state: PendulumState, params: PendulumParams) => {
+// Computes 3D world-space positions (y-up, floor at y=0) and velocities of both bobs
+export const getBobKinematics = (
+  state: PendulumState,
+  params: PendulumParams,
+  pivotY: number = PIVOT_HEIGHT
+): BobKinematics => {
+  const { theta1, theta2, omega1, omega2 } = state;
+  const { l1, l2 } = params;
+  const derivs = getDerivatives(state, params);
+
+  const x1 = l1 * Math.sin(theta1);
+  const y1 = pivotY - l1 * Math.cos(theta1);
+  const vx1 = l1 * omega1 * Math.cos(theta1);
+  const vy1 = l1 * omega1 * Math.sin(theta1);
+  const speed1 = Math.hypot(vx1, vy1);
+
+  const x2 = x1 + l2 * Math.sin(theta2);
+  const y2 = y1 - l2 * Math.cos(theta2);
+  const vx2 = vx1 + l2 * omega2 * Math.cos(theta2);
+  const vy2 = vy1 + l2 * omega2 * Math.sin(theta2);
+  const speed2 = Math.hypot(vx2, vy2);
+
+  return {
+    pivotY,
+    x1,
+    y1,
+    z1: 0,
+    vx1,
+    vy1,
+    speed1,
+    x2,
+    y2,
+    z2: 0,
+    vx2,
+    vy2,
+    speed2,
+    alpha1: derivs.dOmega1,
+    alpha2: derivs.dOmega2,
+  };
+};
+
+// Calculates Pendulum Mechanical Energy (with Potential Energy referenced to floor y = 0)
+export const calculateEnergy = (
+  state: PendulumState,
+  params: PendulumParams,
+  pivotY: number = PIVOT_HEIGHT
+) => {
   const { theta1, theta2, omega1, omega2 } = state;
   const { m1, m2, l1, l2, g } = params;
 
-  // Kinetic Energy
   const ke1 = 0.5 * m1 * l1 * l1 * omega1 * omega1;
-  const ke2 = 0.5 * m2 * (l1 * l1 * omega1 * omega1 + l2 * l2 * omega2 * omega2 + 2 * l1 * l2 * omega1 * omega2 * Math.cos(theta1 - theta2));
+  const ke2 =
+    0.5 *
+    m2 *
+    (l1 * l1 * omega1 * omega1 +
+      l2 * l2 * omega2 * omega2 +
+      2 * l1 * l2 * omega1 * omega2 * Math.cos(theta1 - theta2));
   const ke = ke1 + ke2;
 
-  // Potential Energy
-  const pe1 = -m1 * g * l1 * Math.cos(theta1);
-  const pe2 = -m2 * g * (l1 * Math.cos(theta1) + l2 * Math.cos(theta2));
-  const pe = pe1 + pe2;
+  const y1 = pivotY - l1 * Math.cos(theta1);
+  const y2 = y1 - l2 * Math.cos(theta2);
+  const pe = m1 * g * y1 + m2 * g * y2;
 
   return { ke, pe, total: ke + pe };
+};
+
+/**
+ * Computes the operational-space inverse effective mass of Bob 1 or Bob 2 along a collision normal (nx, ny)
+ * and applies a Cartesian impulse (Jx, Jy) directly to the generalized velocities (omega1, omega2)
+ * via the Lagrangian mass matrix M(theta) and Jacobian J_v.
+ * This guarantees rod lengths L1 and L2 are strictly preserved during and after impact.
+ */
+export const computeEffectiveInverseMass = (
+  state: PendulumState,
+  params: PendulumParams,
+  bobIndex: 1 | 2,
+  nx: number,
+  ny: number
+): number => {
+  const { theta1, theta2 } = state;
+  const { m1, m2, l1, l2 } = params;
+
+  const M11 = (m1 + m2) * l1 * l1;
+  const M12 = m2 * l1 * l2 * Math.cos(theta1 - theta2);
+  const M22 = m2 * l2 * l2;
+  const det = Math.max(1e-6, M11 * M22 - M12 * M12);
+
+  const invM11 = M22 / det;
+  const invM12 = -M12 / det;
+  const invM22 = M11 / det;
+
+  // J^T * n
+  const jtn1 = l1 * Math.cos(theta1) * nx + l1 * Math.sin(theta1) * ny;
+  const jtn2 = bobIndex === 2 ? l2 * Math.cos(theta2) * nx + l2 * Math.sin(theta2) * ny : 0;
+
+  // n^T * J * M^-1 * J^T * n
+  const invMassEff =
+    jtn1 * (invM11 * jtn1 + invM12 * jtn2) + jtn2 * (invM12 * jtn1 + invM22 * jtn2);
+
+  return Math.max(1e-5, invMassEff);
+};
+
+export const applyGeneralizedImpulse = (
+  state: PendulumState,
+  params: PendulumParams,
+  bobIndex: 1 | 2,
+  Jx: number,
+  Jy: number,
+  posCorrectionX: number = 0,
+  posCorrectionY: number = 0
+): PendulumState => {
+  const { theta1, theta2, omega1, omega2 } = state;
+  const { m1, m2, l1, l2 } = params;
+
+  const M11 = (m1 + m2) * l1 * l1;
+  const M12 = m2 * l1 * l2 * Math.cos(theta1 - theta2);
+  const M22 = m2 * l2 * l2;
+  const det = Math.max(1e-6, M11 * M22 - M12 * M12);
+
+  const invM11 = M22 / det;
+  const invM12 = -M12 / det;
+  const invM22 = M11 / det;
+
+  // Generalized impulse Pi = J_v^T * [Jx, Jy]
+  const pi1 = l1 * Math.cos(theta1) * Jx + l1 * Math.sin(theta1) * Jy;
+  const pi2 = bobIndex === 2 ? l2 * Math.cos(theta2) * Jx + l2 * Math.sin(theta2) * Jy : 0;
+
+  const dOmega1 = invM11 * pi1 + invM12 * pi2;
+  const dOmega2 = invM12 * pi1 + invM22 * pi2;
+
+  // Small angular position projection to resolve sphere-box overlap cleanly without violating rod lengths
+  let dTheta1 = 0;
+  let dTheta2 = 0;
+  if (bobIndex === 1) {
+    dTheta1 = (Math.cos(theta1) * posCorrectionX + Math.sin(theta1) * posCorrectionY) / l1;
+  } else {
+    dTheta2 = (Math.cos(theta2) * posCorrectionX + Math.sin(theta2) * posCorrectionY) / l2;
+  }
+
+  return {
+    theta1: theta1 + dTheta1,
+    theta2: theta2 + dTheta2,
+    omega1: Math.max(-35, Math.min(35, omega1 + dOmega1)),
+    omega2: Math.max(-45, Math.min(45, omega2 + dOmega2)),
+  };
+};
+
+export const getBobRadius = (mass: number): number => {
+  return Math.max(0.09, Math.min(0.24, 0.085 * Math.cbrt(mass)));
 };
