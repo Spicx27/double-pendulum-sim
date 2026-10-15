@@ -174,10 +174,8 @@ export const calculateEnergy = (
 };
 
 /**
- * Computes the operational-space inverse effective mass of Bob 1 or Bob 2 along a collision normal (nx, ny)
- * and applies a Cartesian impulse (Jx, Jy) directly to the generalized velocities (omega1, omega2)
- * via the Lagrangian mass matrix M(theta) and Jacobian J_v.
- * This guarantees rod lengths L1 and L2 are strictly preserved during and after impact.
+ * Computes operational-space inverse effective mass along collision normal (nx, ny).
+ * Includes physical mass bounds so near-collinear rod alignments never cause division-by-zero impulse spikes.
  */
 export const computeEffectiveInverseMass = (
   state: PendulumState,
@@ -192,23 +190,29 @@ export const computeEffectiveInverseMass = (
   const M11 = (m1 + m2) * l1 * l1;
   const M12 = m2 * l1 * l2 * Math.cos(theta1 - theta2);
   const M22 = m2 * l2 * l2;
-  const det = Math.max(1e-6, M11 * M22 - M12 * M12);
+  const det = Math.max(1e-4, M11 * M22 - M12 * M12);
 
   const invM11 = M22 / det;
   const invM12 = -M12 / det;
   const invM22 = M11 / det;
 
-  // J^T * n
   const jtn1 = l1 * Math.cos(theta1) * nx + l1 * Math.sin(theta1) * ny;
   const jtn2 = bobIndex === 2 ? l2 * Math.cos(theta2) * nx + l2 * Math.sin(theta2) * ny : 0;
 
-  // n^T * J * M^-1 * J^T * n
-  const invMassEff =
+  const rawInvMassEff =
     jtn1 * (invM11 * jtn1 + invM12 * jtn2) + jtn2 * (invM12 * jtn1 + invM22 * jtn2);
 
-  return Math.max(1e-5, invMassEff);
+  // Physical bounds: effective mass cannot exceed total pendulum mass or be less than 0.35 * bob mass
+  const minInvMass = 1 / (m1 + m2);
+  const maxInvMass = 1 / (0.35 * (bobIndex === 1 ? m1 : m2));
+
+  return Math.max(minInvMass, Math.min(maxInvMass, rawInvMassEff));
 };
 
+/**
+ * Projects a Cartesian collision impulse (Jx, Jy) into generalized angular velocities (omega1, omega2)
+ * while enforcing passive thermodynamic energy conservation (collision with a passive wall can never add KE).
+ */
 export const applyGeneralizedImpulse = (
   state: PendulumState,
   params: PendulumParams,
@@ -216,28 +220,15 @@ export const applyGeneralizedImpulse = (
   Jx: number,
   Jy: number,
   posCorrectionX: number = 0,
-  posCorrectionY: number = 0
+  posCorrectionY: number = 0,
+  maxEnergyRetention: number = 0.92
 ): PendulumState => {
   const { theta1, theta2, omega1, omega2 } = state;
   const { m1, m2, l1, l2 } = params;
 
-  const M11 = (m1 + m2) * l1 * l1;
-  const M12 = m2 * l1 * l2 * Math.cos(theta1 - theta2);
-  const M22 = m2 * l2 * l2;
-  const det = Math.max(1e-6, M11 * M22 - M12 * M12);
+  const preKE = calculateEnergy(state, params).ke;
 
-  const invM11 = M22 / det;
-  const invM12 = -M12 / det;
-  const invM22 = M11 / det;
-
-  // Generalized impulse Pi = J_v^T * [Jx, Jy]
-  const pi1 = l1 * Math.cos(theta1) * Jx + l1 * Math.sin(theta1) * Jy;
-  const pi2 = bobIndex === 2 ? l2 * Math.cos(theta2) * Jx + l2 * Math.sin(theta2) * Jy : 0;
-
-  const dOmega1 = invM11 * pi1 + invM12 * pi2;
-  const dOmega2 = invM12 * pi1 + invM22 * pi2;
-
-  // Small angular position projection to resolve sphere-box overlap cleanly without violating rod lengths
+  // Small angular position projection to resolve overlap without altering rod lengths
   let dTheta1 = 0;
   let dTheta2 = 0;
   if (bobIndex === 1) {
@@ -245,12 +236,63 @@ export const applyGeneralizedImpulse = (
   } else {
     dTheta2 = (Math.cos(theta2) * posCorrectionX + Math.sin(theta2) * posCorrectionY) / l2;
   }
+  // Clamp single-substep angular position correction to prevent teleportation
+  dTheta1 = Math.max(-0.025, Math.min(0.025, dTheta1));
+  dTheta2 = Math.max(-0.025, Math.min(0.025, dTheta2));
+
+  const nextTheta1 = theta1 + dTheta1;
+  const nextTheta2 = theta2 + dTheta2;
+
+  if (Jx === 0 && Jy === 0) {
+    return {
+      theta1: nextTheta1,
+      theta2: nextTheta2,
+      omega1,
+      omega2,
+    };
+  }
+
+  const M11 = (m1 + m2) * l1 * l1;
+  const M12 = m2 * l1 * l2 * Math.cos(theta1 - theta2);
+  const M22 = m2 * l2 * l2;
+  const det = Math.max(1e-4, M11 * M22 - M12 * M12);
+
+  const invM11 = M22 / det;
+  const invM12 = -M12 / det;
+  const invM22 = M11 / det;
+
+  const pi1 = l1 * Math.cos(theta1) * Jx + l1 * Math.sin(theta1) * Jy;
+  const pi2 = bobIndex === 2 ? l2 * Math.cos(theta2) * Jx + l2 * Math.sin(theta2) * Jy : 0;
+
+  // Damp off-diagonal coupling slightly during sharp impacts to prevent numerical whip spikes
+  const couplingDamp = 0.65;
+  const dOmega1 = invM11 * pi1 + couplingDamp * invM12 * pi2;
+  const dOmega2 = couplingDamp * invM12 * pi1 + invM22 * pi2;
+
+  let nextOmega1 = omega1 + dOmega1;
+  let nextOmega2 = omega2 + dOmega2;
+
+  // Thermodynamic passivity check: passive wall collision cannot increase total pendulum kinetic energy
+  const candidateState: PendulumState = {
+    theta1: nextTheta1,
+    theta2: nextTheta2,
+    omega1: nextOmega1,
+    omega2: nextOmega2,
+  };
+  const postKE = calculateEnergy(candidateState, params).ke;
+  const maxAllowedKE = Math.max(0.05, preKE * maxEnergyRetention);
+
+  if (preKE > 0.01 && postKE > maxAllowedKE) {
+    const scale = Math.sqrt(maxAllowedKE / postKE);
+    nextOmega1 *= scale;
+    nextOmega2 *= scale;
+  }
 
   return {
-    theta1: theta1 + dTheta1,
-    theta2: theta2 + dTheta2,
-    omega1: Math.max(-35, Math.min(35, omega1 + dOmega1)),
-    omega2: Math.max(-45, Math.min(45, omega2 + dOmega2)),
+    theta1: nextTheta1,
+    theta2: nextTheta2,
+    omega1: Math.max(-25, Math.min(25, nextOmega1)),
+    omega2: Math.max(-30, Math.min(30, nextOmega2)),
   };
 };
 

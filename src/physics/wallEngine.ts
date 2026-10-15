@@ -5,6 +5,7 @@ import {
   computeEffectiveInverseMass,
   applyGeneralizedImpulse,
   getBobRadius,
+  calculateEnergy,
   PIVOT_HEIGHT,
 } from './engine';
 
@@ -67,7 +68,7 @@ export interface BlockBond {
   id: string;
   blockA: number;
   blockB: number; // -1 indicates bond to foundation floor
-  area: number;   // m^2
+  area: number;   // m^2 (effective shear/flexural mortar bed area)
   stressLoadKPa: number;
   damage: number; // 0..1
   broken: boolean;
@@ -158,7 +159,6 @@ export const createWallSystem = (
   let idCounter = 0;
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
-      // Slight running-bond Z stagger on alternate rows for brick masonry realism
       const staggerZ =
         config.structureType === 'brick_wall' && r % 2 === 1 ? (c === 0 ? 0.04 : -0.04) : 0;
 
@@ -197,46 +197,43 @@ export const createWallSystem = (
     }
   }
 
-  // Create explicit mortar/structural bonds between neighboring blocks
-  const horizArea = bw * bd;
-  const vertArea = bh * bd;
+  // Effective mortar bed joint area (localized flexural/shear bond zone)
+  const horizBondArea = bw * bd * 0.16;
+  const vertBondArea = bh * bd * 0.16;
 
   blocks.forEach((b) => {
-    // Foundation bond for row 0
     if (b.row === 0) {
       bonds.push({
         id: `ground_${b.id}`,
         blockA: b.id,
         blockB: -1,
-        area: horizArea,
+        area: horizBondArea,
         stressLoadKPa: 0,
         damage: 0,
         broken: false,
       });
     }
 
-    // Vertical bond to the block directly above
     const above = blocks.find((other) => other.row === b.row + 1 && other.col === b.col);
     if (above) {
       bonds.push({
         id: `v_${b.id}_${above.id}`,
         blockA: b.id,
         blockB: above.id,
-        area: horizArea,
+        area: horizBondArea,
         stressLoadKPa: 0,
         damage: 0,
         broken: false,
       });
     }
 
-    // Horizontal bond to the block on the right
     const right = blocks.find((other) => other.row === b.row && other.col === b.col + 1);
     if (right) {
       bonds.push({
         id: `h_${b.id}_${right.id}`,
         blockA: b.id,
         blockB: right.id,
-        area: vertArea,
+        area: vertBondArea,
         stressLoadKPa: 0,
         damage: 0,
         broken: false,
@@ -268,7 +265,6 @@ const updateStructuralConnectivity = (blocks: WallBlock[], bonds: BlockBond[]): 
   const visited = new Set<number>();
   const queue: number[] = [];
 
-  // Seed queue with blocks that still have an intact foundation bond
   for (const bond of bonds) {
     if (!bond.broken && bond.blockB === -1) {
       const b = blocks[bond.blockA];
@@ -279,7 +275,6 @@ const updateStructuralConnectivity = (blocks: WallBlock[], bonds: BlockBond[]): 
     }
   }
 
-  // Traverse intact inter-block bonds
   while (queue.length > 0) {
     const curr = queue.shift()!;
     for (const bond of bonds) {
@@ -301,7 +296,6 @@ const updateStructuralConnectivity = (blocks: WallBlock[], bonds: BlockBond[]): 
       b.isDetached = true;
       b.anchoredToGround = false;
       b.damage = Math.max(b.damage, 1.0);
-      // Break any remaining bonds attached to this detached block
       for (const bond of bonds) {
         if (bond.blockA === b.id || bond.blockB === b.id) {
           bond.broken = true;
@@ -329,7 +323,6 @@ const generateContactForceCurve = (
   for (let i = 0; i < numPoints; i++) {
     const frac = i / (numPoints - 1);
     const t = frac * durationMs;
-    // Half-sine skewed viscoelastic pulse profile
     const shape = Math.sin(Math.PI * frac) * Math.exp(-0.35 * (frac - 0.45));
     const normalizedShape = Math.max(0, Math.min(1, shape / 0.96));
     samples.push({
@@ -364,51 +357,36 @@ export const stepWallAndCollisions = (
   let cumulativeFractureEnergy = wallState.cumulativeFractureEnergy;
   const newImpacts: ImpactEvent[] = [];
 
-  const kin = getBobKinematics(currentPendulum, pendulumParams, PIVOT_HEIGHT);
-  const bobs = [
-    {
-      index: 1 as const,
-      x: kin.x1,
-      y: kin.y1,
-      z: kin.z1,
-      vx: kin.vx1,
-      vy: kin.vy1,
-      speed: kin.speed1,
-      mass: pendulumParams.m1,
-      radius: getBobRadius(pendulumParams.m1),
-    },
-    {
-      index: 2 as const,
-      x: kin.x2,
-      y: kin.y2,
-      z: kin.z2,
-      vx: kin.vx2,
-      vy: kin.vy2,
-      speed: kin.speed2,
-      mass: pendulumParams.m2,
-      radius: getBobRadius(pendulumParams.m2),
-    },
-  ];
+  // 1. Check 3D Sphere-AABB collisions for Bob 1 and Bob 2
+  for (const bobIndex of [1, 2] as const) {
+    const radius = getBobRadius(bobIndex === 1 ? pendulumParams.m1 : pendulumParams.m2);
+    const bobMass = bobIndex === 1 ? pendulumParams.m1 : pendulumParams.m2;
 
-  // 1. Check 3D Sphere-AABB collisions between both Pendulum Bobs and Wall Blocks
-  for (const bob of bobs) {
     for (const block of blocks) {
+      // Recompute live bob kinematics before EVERY block check so multi-brick seam contacts never stack impulses
+      const liveKin = getBobKinematics(currentPendulum, pendulumParams, PIVOT_HEIGHT);
+      const bobX = bobIndex === 1 ? liveKin.x1 : liveKin.x2;
+      const bobY = bobIndex === 1 ? liveKin.y1 : liveKin.y2;
+      const bobZ = bobIndex === 1 ? liveKin.z1 : liveKin.z2;
+      const bobVx = bobIndex === 1 ? liveKin.vx1 : liveKin.vx2;
+      const bobVy = bobIndex === 1 ? liveKin.vy1 : liveKin.vy2;
+      const bobSpeed = bobIndex === 1 ? liveKin.speed1 : liveKin.speed2;
+
       const halfW = block.width / 2;
       const halfH = block.height / 2;
       const halfD = block.depth / 2;
 
-      const closestX = Math.max(block.x - halfW, Math.min(bob.x, block.x + halfW));
-      const closestY = Math.max(block.y - halfH, Math.min(bob.y, block.y + halfH));
-      const closestZ = Math.max(block.z - halfD, Math.min(bob.z, block.z + halfD));
+      const closestX = Math.max(block.x - halfW, Math.min(bobX, block.x + halfW));
+      const closestY = Math.max(block.y - halfH, Math.min(bobY, block.y + halfH));
+      const closestZ = Math.max(block.z - halfD, Math.min(bobZ, block.z + halfD));
 
-      const dx = bob.x - closestX;
-      const dy = bob.y - closestY;
-      const dz = bob.z - closestZ;
+      const dx = bobX - closestX;
+      const dy = bobY - closestY;
+      const dz = bobZ - closestZ;
       const distSq = dx * dx + dy * dy + dz * dz;
 
-      if (distSq < bob.radius * bob.radius) {
+      if (distSq < radius * radius) {
         const dist = Math.sqrt(distSq);
-        // Contact normal pointing from Block -> Bob
         let nx = 0;
         let ny = 0;
         let nz = 0;
@@ -417,49 +395,43 @@ export const stepWallAndCollisions = (
           ny = dy / dist;
           nz = dz / dist;
         } else {
-          nx = bob.x <= block.x ? -1 : 1;
+          nx = bobX <= block.x ? -1 : 1;
           ny = 0;
           nz = 0;
         }
 
-        const penetration = bob.radius - dist + 0.002;
+        const penetration = radius - dist + 0.0015;
 
-        // Relative velocity along contact normal
-        const rvx = bob.vx - block.vx;
-        const rvy = bob.vy - block.vy;
+        const rvx = bobVx - block.vx;
+        const rvy = bobVy - block.vy;
         const rvz = 0 - block.vz;
         const velAlongNormal = rvx * nx + rvy * ny + rvz * nz;
 
-        // Always project out small overlap so the bob cannot tunnel through the wall
         const posCorrX = nx * penetration;
         const posCorrY = ny * penetration;
 
-        // Only apply impulse if the bob and block are approaching each other
-        if (velAlongNormal < -0.02) {
-          const preKE =
-            0.5 * pendulumParams.m1 * kin.speed1 * kin.speed1 +
-            0.5 * pendulumParams.m2 * kin.speed2 * kin.speed2;
+        // Only apply collision impulse if approaching and outside per-block micro-cooldown (15ms)
+        if (velAlongNormal < -0.04 && simTime - block.lastImpactTime > 0.015) {
+          const preKE = calculateEnergy(currentPendulum, pendulumParams, PIVOT_HEIGHT).ke;
 
           const invMassPendulum = computeEffectiveInverseMass(
             currentPendulum,
             pendulumParams,
-            bob.index,
+            bobIndex,
             nx,
             ny
           );
 
-          // Effective block inverse mass: if still bonded, the wall provides structural resistance
           const intactBondsForBlock = bonds.filter(
             (bd) => !bd.broken && (bd.blockA === block.id || bd.blockB === block.id)
           );
           const invMassBlock = block.isDetached
             ? 1 / block.mass
-            : 1 / (block.mass * (2.5 + intactBondsForBlock.length * 1.8));
+            : 1 / (block.mass * (2.0 + intactBondsForBlock.length * 1.5));
 
           const e = material.restitution;
           const jMag = (-(1 + e) * velAlongNormal) / (invMassPendulum + invMassBlock);
 
-          // Contact duration from Kelvin-Voigt compliant contact mechanics: dt_c = pi * sqrt(m_eff / k_c)
           const mEff = 1 / (invMassPendulum + invMassBlock);
           const contactDurationSec = Math.max(
             0.003,
@@ -469,9 +441,9 @@ export const stepWallAndCollisions = (
           const avgForceN = jMag / contactDurationSec;
           const peakForceN = avgForceN * (Math.PI / 2);
 
-          // Distribute contact force across connected mortar bonds & neighbors
           let damagedBlocksCount = 0;
-          const bondFailureForceN = material.bondStrength * 1000 * (block.width * block.depth);
+          const effectiveMortarArea = block.width * block.depth * 0.16;
+          const bondFailureForceN = material.bondStrength * 1000 * effectiveMortarArea;
 
           for (const other of blocks) {
             if (other.isDetached && other.id !== block.id) continue;
@@ -480,12 +452,12 @@ export const stepWallAndCollisions = (
               other.y - block.y,
               other.z - block.z
             );
-            const radiusOfInfluence = Math.max(block.width, block.height) * 2.35;
+            const radiusOfInfluence = Math.max(block.width, block.height) * 2.25;
             if (dBlock <= radiusOfInfluence) {
-              const attenuation = Math.exp(-dBlock / (Math.max(block.width, block.height) * 0.95));
+              const attenuation = Math.exp(-dBlock / (Math.max(block.width, block.height) * 0.9));
               const localForceN = peakForceN * attenuation;
-              const effectiveArea = other.width * other.depth;
-              const localStressKPa = localForceN / effectiveArea / 1000;
+              const localArea = other.width * other.depth * 0.16;
+              const localStressKPa = localForceN / localArea / 1000;
 
               other.peakStressKPa = Math.max(other.peakStressKPa, localStressKPa);
               const damageIncrement = localStressKPa / material.bondStrength;
@@ -498,7 +470,7 @@ export const stepWallAndCollisions = (
             }
           }
 
-          // Check and break mortar bonds whose stress exceeds material.bondStrength
+          // Check and fracture mortar bonds exceeding material.bondStrength
           for (const bond of bonds) {
             if (bond.broken) continue;
             const bA = blocks[bond.blockA];
@@ -509,7 +481,7 @@ export const stepWallAndCollisions = (
               : dA;
             const minD = Math.min(dA, dB);
             const bondAttenuation = Math.exp(
-              -minD / (Math.max(block.width, block.height) * 1.05)
+              -minD / (Math.max(block.width, block.height) * 1.0)
             );
 
             const bondForce = peakForceN * bondAttenuation;
@@ -528,10 +500,8 @@ export const stepWallAndCollisions = (
             }
           }
 
-          // Update structural connectivity (blocks that lost all bonds or support detach)
           const newlyDetachedFromSupport = updateStructuralConnectivity(blocks, bonds);
 
-          // Also detach any block whose direct damage >= 1.0
           let directDetached = 0;
           for (const other of blocks) {
             if (!other.isDetached && other.damage >= 1.0) {
@@ -550,26 +520,26 @@ export const stepWallAndCollisions = (
           const totalDetachedThisImpact =
             newlyDetachedFromSupport + directDetached + cascadeDetached;
 
-          // If target block (or neighboring blocks) detached, transfer impulse into 3D block velocity
+          // Transfer impulse to detached 3D fragments
           let transferredKE = 0;
           for (const other of blocks) {
             if (other.isDetached) {
               const dBlock = Math.hypot(other.x - block.x, other.y - block.y);
-              if (dBlock <= Math.max(block.width, block.height) * 1.8) {
-                const share = other.id === block.id ? 0.72 : 0.28 * Math.exp(-dBlock * 3);
+              if (dBlock <= Math.max(block.width, block.height) * 1.75) {
+                const share = other.id === block.id ? 0.68 : 0.24 * Math.exp(-dBlock * 3);
                 const blockImpulse = jMag * share;
                 const pushDirX = -nx;
-                const pushDirY = Math.max(-0.2, -ny + 0.15);
-                const pushDirZ = (other.col - 0.5) * 0.28 + (other.row % 2 === 0 ? 0.12 : -0.12);
+                const pushDirY = Math.max(-0.15, -ny + 0.12);
+                const pushDirZ =
+                  (other.col - 0.5) * 0.25 + (other.row % 2 === 0 ? 0.1 : -0.1);
 
                 other.vx += (blockImpulse * pushDirX) / other.mass;
                 other.vy += (blockImpulse * pushDirY) / other.mass;
                 other.vz += (blockImpulse * pushDirZ) / other.mass;
 
-                // Torque induced angular velocity from off-center contact
                 const leverY = closestY - other.y;
-                other.wz += (-pushDirX * leverY * blockImpulse * 4.5) / other.mass;
-                other.wx += (pushDirZ * leverY * blockImpulse * 3.0) / other.mass;
+                other.wz += (-pushDirX * leverY * blockImpulse * 4.0) / other.mass;
+                other.wx += (pushDirZ * leverY * blockImpulse * 2.5) / other.mass;
 
                 const speedSq =
                   other.vx * other.vx + other.vy * other.vy + other.vz * other.vz;
@@ -578,34 +548,38 @@ export const stepWallAndCollisions = (
             }
           }
 
-          // If the struck block fractured/detached, the pendulum ploughs through with reduced reaction impulse
-          const reactionScale = block.isDetached ? 0.42 : 1.0;
+          block.lastImpactTime = simTime;
+
+          // If the block fractured, the collision is highly inelastic and the bob loses energy ploughing through
+          const reactionScale = block.isDetached ? 0.35 : 0.85;
+          const maxEnergyRetention = block.isDetached
+            ? 0.55
+            : Math.min(0.85, 0.35 + material.restitution * 0.6);
+
           const Jx = jMag * nx * reactionScale;
           const Jy = jMag * ny * reactionScale;
 
           currentPendulum = applyGeneralizedImpulse(
             currentPendulum,
             pendulumParams,
-            bob.index,
+            bobIndex,
             Jx,
             Jy,
             posCorrX,
-            posCorrY
+            posCorrY,
+            maxEnergyRetention
           );
 
           const postKin = getBobKinematics(currentPendulum, pendulumParams, PIVOT_HEIGHT);
-          const postVx = bob.index === 1 ? postKin.vx1 : postKin.vx2;
-          const postVy = bob.index === 1 ? postKin.vy1 : postKin.vy2;
-          const postSpeed = bob.index === 1 ? postKin.speed1 : postKin.speed2;
-          const postKE =
-            0.5 * pendulumParams.m1 * postKin.speed1 * postKin.speed1 +
-            0.5 * pendulumParams.m2 * postKin.speed2 * postKin.speed2;
+          const postVx = bobIndex === 1 ? postKin.vx1 : postKin.vx2;
+          const postVy = bobIndex === 1 ? postKin.vy1 : postKin.vy2;
+          const postSpeed = bobIndex === 1 ? postKin.speed1 : postKin.speed2;
+          const postKE = calculateEnergy(currentPendulum, pendulumParams, PIVOT_HEIGHT).ke;
 
           const momentumChange =
-            bob.mass * Math.hypot(postVx - bob.vx, postVy - bob.vy);
+            bobMass * Math.hypot(postVx - bobVx, postVy - bobVy);
           const dissipatedEnergy = Math.max(0, preKE - postKE - transferredKE);
 
-          // Record active 3D Force Vector Arrow at contact point
           activeForceArrow = {
             active: true,
             x: closestX,
@@ -625,12 +599,11 @@ export const stepWallAndCollisions = (
             time: simTime,
           });
 
-          // Record ImpactEvent if impulse is significant and not a micro-chatter duplicate
-          if (jMag > 0.15 && simTime - block.lastImpactTime >= 0) {
+          if (jMag > 0.15) {
             newImpacts.push({
               id: nextImpactId + newImpacts.length,
               simTime: Number(simTime.toFixed(3)),
-              bobIndex: bob.index,
+              bobIndex,
               blockId: block.id,
               contactPoint: {
                 x: Number(closestX.toFixed(2)),
@@ -643,9 +616,9 @@ export const stepWallAndCollisions = (
                 z: Number((-nz).toFixed(2)),
               },
               preVelocity: {
-                vx: Number(bob.vx.toFixed(2)),
-                vy: Number(bob.vy.toFixed(2)),
-                speed: Number(bob.speed.toFixed(2)),
+                vx: Number(bobVx.toFixed(2)),
+                vy: Number(bobVy.toFixed(2)),
+                speed: Number(bobSpeed.toFixed(2)),
               },
               postVelocity: {
                 vx: Number(postVx.toFixed(2)),
@@ -673,66 +646,60 @@ export const stepWallAndCollisions = (
             });
           }
         } else {
-          // Pure positional separation if resting against block
+          // Gentle positional separation if resting against a block
           currentPendulum = applyGeneralizedImpulse(
             currentPendulum,
             pendulumParams,
-            bob.index,
+            bobIndex,
             0,
             0,
-            posCorrX * 0.5,
-            posCorrY * 0.5
+            posCorrX * 0.35,
+            posCorrY * 0.35
           );
         }
       }
     }
   }
 
-  // Fade out active force vector after 0.35s
   if (activeForceArrow.active && simTime - activeForceArrow.timestamp > 0.35) {
     activeForceArrow.active = false;
   }
 
-  // 2. Step 3D Rigid-Body Physics for Detached Wall Fragments (Gravity, Floor & Fragment Collisions)
+  // 2. Step 3D Rigid-Body Physics for Detached Wall Fragments (Gravity & Floor Restitution)
   const detachedBlocks = blocks.filter((b) => b.isDetached);
   for (const b of detachedBlocks) {
-    // Gravity
     b.vy -= pendulumParams.g * dt;
 
-    // Linear integration
     b.x += b.vx * dt;
     b.y += b.vy * dt;
     b.z += b.vz * dt;
 
-    // Angular integration
     b.rx += b.wx * dt;
     b.ry += b.wy * dt;
     b.rz += b.wz * dt;
 
-    // Floor collision (y = 0)
     const minY = b.height / 2;
     if (b.y < minY) {
       b.y = minY;
       if (b.vy < 0) {
-        b.vy = -b.vy * (material.restitution * 0.55);
-        // Floor sliding friction
-        b.vx *= 0.82;
-        b.vz *= 0.82;
-        b.wx *= 0.78;
-        b.wy *= 0.78;
-        b.wz *= 0.78;
+        b.vy = -b.vy * (material.restitution * 0.45);
+        b.vx *= 0.8;
+        b.vz *= 0.8;
+        b.wx *= 0.75;
+        b.wy *= 0.75;
+        b.wz *= 0.75;
       }
       if (Math.abs(b.vy) < 0.08) b.vy = 0;
     }
   }
 
-  // 3. Block-to-Block Collisions (Detached fragments colliding with intact blocks or other fragments)
+  // 3. Block-to-Block Collisions
   for (let i = 0; i < detachedBlocks.length; i++) {
     const b1 = detachedBlocks[i];
     for (let j = 0; j < blocks.length; j++) {
       const b2 = blocks[j];
       if (b1.id === b2.id) continue;
-      if (b2.isDetached && b1.id > b2.id) continue; // avoid double checking pair
+      if (b2.isDetached && b1.id > b2.id) continue;
 
       const dx = b1.x - b2.x;
       const dy = b1.y - b2.y;
@@ -743,7 +710,6 @@ export const stepWallAndCollisions = (
       const overlapZ = (b1.depth + b2.depth) / 2 - Math.abs(dz);
 
       if (overlapX > 0 && overlapY > 0 && overlapZ > 0) {
-        // Resolve along minimum penetration axis
         if (overlapY <= overlapX && overlapY <= overlapZ) {
           const sign = dy >= 0 ? 1 : -1;
           if (b2.isDetached) {
@@ -754,7 +720,7 @@ export const stepWallAndCollisions = (
             b2.vy = avgVy;
           } else {
             b1.y += sign * overlapY;
-            if (b1.vy * sign < 0) b1.vy = -b1.vy * 0.3;
+            if (b1.vy * sign < 0) b1.vy = -b1.vy * 0.25;
           }
         } else if (overlapX <= overlapY && overlapX <= overlapZ) {
           const sign = dx >= 0 ? 1 : -1;
@@ -766,7 +732,7 @@ export const stepWallAndCollisions = (
             b2.vx = avgVx;
           } else {
             b1.x += sign * overlapX;
-            if (b1.vx * sign < 0) b1.vx = -b1.vx * 0.4;
+            if (b1.vx * sign < 0) b1.vx = -b1.vx * 0.3;
           }
         } else {
           const sign = dz >= 0 ? 1 : -1;
